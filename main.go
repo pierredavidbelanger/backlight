@@ -6,7 +6,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
-	"path"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -17,12 +17,14 @@ var deviceFile string
 var deviceActualBrightnessFile string
 var deviceMaxBrightnessFile string
 var deviceBrightnessFile string
+var deviceLatestBrightnessFile string
 
 func main() {
 
 	app := cli.NewApp()
 	app.Name = "backlight"
 	app.Usage = "get or set backlight"
+	app.Version = "v1.0.0"
 	app.ErrWriter = os.Stderr
 
 	app.Flags = []cli.Flag{
@@ -39,6 +41,12 @@ func main() {
 			Aliases: []string{"g"},
 			Usage:   "get the actual backlight value",
 			Action:  actionGet,
+		},
+		{
+			Name:    "restore",
+			Aliases: []string{"r"},
+			Usage:   "restore the last known backlight value",
+			Action:  actionRestore,
 		},
 		{
 			Name:      "set",
@@ -60,12 +68,6 @@ func main() {
 			Usage:     "decrement the new backlight value",
 			Action:    actionDec,
 			ArgsUsage: "n[%]",
-		},
-		{
-			Name:    "restore",
-			Aliases: []string{"r"},
-			Usage:   "restore the last known backlight value",
-			Action:  actionRestore,
 		},
 	}
 
@@ -104,20 +106,33 @@ func main() {
 			return fmt.Errorf("%s should point to a device folder", deviceFile)
 		}
 
-		deviceActualBrightnessFile = path.Join(deviceFile, "actual_brightness")
+		deviceActualBrightnessFile = filepath.Join(deviceFile, "actual_brightness")
 		_, err = fileMustExists(deviceActualBrightnessFile, "device's actual_brightness file must exists")
 		if err != nil {
 			return err
 		}
 
-		deviceMaxBrightnessFile = path.Join(deviceFile, "max_brightness")
+		deviceMaxBrightnessFile = filepath.Join(deviceFile, "max_brightness")
 		_, err = fileMustExists(deviceMaxBrightnessFile, "device's max_brightness file must exists")
 		if err != nil {
 			return err
 		}
 
-		deviceBrightnessFile = path.Join(deviceFile, "brightness")
+		deviceBrightnessFile = filepath.Join(deviceFile, "brightness")
 		_, err = fileMustExists(deviceBrightnessFile, "device's brightness file must exists")
+		if err != nil {
+			return err
+		}
+
+		deviceName := filepath.Base(deviceFile)
+
+		usr, err := user.Current()
+		if err != nil {
+			return err
+		}
+		deviceLatestBrightnessFile = filepath.Join(usr.HomeDir, ".cache", "backlight", deviceName)
+		deviceLatestBrightnessDiv := filepath.Dir(deviceLatestBrightnessFile)
+		err = os.MkdirAll(deviceLatestBrightnessDiv, os.ModePerm)
 		if err != nil {
 			return err
 		}
@@ -133,7 +148,11 @@ func main() {
 }
 
 func actionGet(c *cli.Context) error {
-	return get(c)
+	return get(c, deviceActualBrightnessFile, deviceLatestBrightnessFile)
+}
+
+func actionRestore(c *cli.Context) (err error) {
+	return get(c, deviceLatestBrightnessFile, deviceBrightnessFile)
 }
 
 func actionSet(c *cli.Context) error {
@@ -156,16 +175,21 @@ func fileMustExists(filePath string, message string) (os.FileInfo, error) {
 	return info, nil
 }
 
-func actionRestore(c *cli.Context) (err error) {
-	fmt.Println("Restore")
-	return nil
-}
+func get(c *cli.Context, readFile, writeFile string) (err error) {
 
-func get(c *cli.Context) (err error) {
-
-	actual, max, err := read()
+	actual, err := read(readFile)
 	if err != nil {
 		return
+	}
+
+	max, err := read(deviceMaxBrightnessFile)
+	if err != nil {
+		return nil
+	}
+
+	err = write(writeFile, actual)
+	if err != nil {
+		return err
 	}
 
 	fmt.Printf("device:%s\nactual:%d\nmax:%d\n", deviceFile, actual, max)
@@ -175,18 +199,29 @@ func get(c *cli.Context) (err error) {
 
 func set(c *cli.Context, action int) (err error) {
 
-	value, percent, err := parseValue(c)
+	value, percent, err := parseValueArg(c)
 	if err != nil {
 		return
 	}
 
-	actual, max, err := read()
+	actual, err := read(deviceActualBrightnessFile)
+	if err != nil {
+		return
+	}
+
+	max, err := read(deviceMaxBrightnessFile)
 	if err != nil {
 		return
 	}
 
 	if percent {
-		value = (max / 100) * value
+		if value <= 0 {
+			value = 0
+		} else if value >= 100 {
+			value = max
+		} else {
+			value = (max / 100) * value
+		}
 	}
 
 	if action < 0 {
@@ -203,7 +238,7 @@ func set(c *cli.Context, action int) (err error) {
 		actual = max
 	}
 
-	err = write(actual)
+	err = write(deviceBrightnessFile, actual)
 	if err != nil {
 		return
 	}
@@ -211,7 +246,7 @@ func set(c *cli.Context, action int) (err error) {
 	return actionGet(c)
 }
 
-func parseValue(c *cli.Context) (value int, percent bool, err error) {
+func parseValueArg(c *cli.Context) (value int, percent bool, err error) {
 
 	if c.NArg() != 1 {
 		err = fmt.Errorf("a value to set is needed")
@@ -238,27 +273,19 @@ func parseValue(c *cli.Context) (value int, percent bool, err error) {
 	return
 }
 
-func read() (actual, max int, err error) {
-	actualBytes, err := ioutil.ReadFile(deviceActualBrightnessFile)
+func read(file string) (value int, err error) {
+	bytes, err := ioutil.ReadFile(file)
 	if err != nil {
 		return
 	}
-	actual, err = strconv.Atoi(strings.TrimSpace(string(actualBytes)))
-	if err != nil {
-		return
-	}
-	maxBytes, err := ioutil.ReadFile(deviceMaxBrightnessFile)
-	if err != nil {
-		return
-	}
-	max, err = strconv.Atoi(strings.TrimSpace(string(maxBytes)))
+	value, err = strconv.Atoi(strings.TrimSpace(string(bytes)))
 	if err != nil {
 		return
 	}
 	return
 }
 
-func write(actual int) error {
+func write(file string, actual int) error {
 	data := fmt.Sprintf("%s\n", strconv.Itoa(actual))
-	return ioutil.WriteFile(deviceBrightnessFile, []byte(data), 0)
+	return ioutil.WriteFile(file, []byte(data), 0644)
 }
